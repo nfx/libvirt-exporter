@@ -1,0 +1,8 @@
+Copyright 2026, Serge Smertin
+
+This Software contains code from the following open source projects, licensed under the Apache 2.0 license:
+
+Libvirt Exporter Improved - https://github.com/rumanzo/libvirt_exporter_improved
+Copyright 2017 Kumina, https://kumina.nl/
+Copyright 2019, Alexey Kostin
+License - https://github.com/rumanzo/libvirt_exporter_improved/blob/master/LICENSE
