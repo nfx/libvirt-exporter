@@ -552,9 +552,72 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 
 	// Report network interface statistics.
 	netCount, ok := params["net.count"].(uint32)
-	if !ok {
-		return fmt.Errorf("net.count not found in domain %s stats", domainName)
+	if ok {
+		e.collectNet(netCount, domainName, desc, ch, params)
 	}
+
+	// Collect Memory Stats
+	memorystat, err := e.conn.DomainMemoryStats(dom, 11, 0)
+	var MemoryStats VirDomainMemoryStats
+	var used_percent float64
+	if err == nil {
+		MemoryStats = MemoryStatCollect(&memorystat)
+		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
+			used_percent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
+		}
+
+	}
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatMajorfaultDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Major_fault),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatMinorFaultDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Minor_fault),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatUnusedDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Unused),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatAvailableDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Available),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatActualBaloonDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Actual_balloon),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatRssDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Rss),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatUsableDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Usable),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatDiskCachesDesc,
+		prometheus.CounterValue,
+		float64(MemoryStats.Disk_caches),
+		domainName)
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainMemoryStatUsedPercentDesc,
+		prometheus.CounterValue,
+		float64(used_percent),
+		domainName)
+
+	return nil
+}
+
+func (e *LibvirtExporter) collectNet(netCount uint32, domainName string, desc Domain,
+	ch chan<- prometheus.Metric, params map[string]any) {
 	for i := range netCount {
 		var sourceBridge string
 		var virtualPortInterfaceID string
@@ -659,65 +722,6 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 				virtualPortInterfaceID)
 		}
 	}
-
-	// Collect Memory Stats
-	memorystat, err := e.conn.DomainMemoryStats(dom, 11, 0)
-	var MemoryStats VirDomainMemoryStats
-	var used_percent float64
-	if err == nil {
-		MemoryStats = MemoryStatCollect(&memorystat)
-		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
-			used_percent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
-		}
-
-	}
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatMajorfaultDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Major_fault),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatMinorFaultDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Minor_fault),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatUnusedDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Unused),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatAvailableDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Available),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatActualBaloonDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Actual_balloon),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatRssDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Rss),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatUsableDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Usable),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatDiskCachesDesc,
-		prometheus.CounterValue,
-		float64(MemoryStats.Disk_caches),
-		domainName)
-	ch <- prometheus.MustNewConstMetric(
-		libvirtDomainMemoryStatUsedPercentDesc,
-		prometheus.CounterValue,
-		float64(used_percent),
-		domainName)
-
-	return nil
 }
 
 func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) VirDomainMemoryStats {
