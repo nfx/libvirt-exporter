@@ -409,13 +409,23 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 	}
 
 	// Report block device statistics.
-	for i := range params["block.count"].(uint32) {
+	blockCount, ok := params["block.count"].(uint32)
+	if !ok {
+		return fmt.Errorf("block.count not found in domain %s stats", domainName)
+	}
+	for i := range blockCount {
 		var diskSource string
-		diskName := params[fmt.Sprintf("block.%d.name", i)].(string)
+		diskName, ok := params[fmt.Sprintf("block.%d.name", i)].(string)
 		if diskName == "hdc" {
 			continue
 		}
-		diskPath := params[fmt.Sprintf("block.%d.path", i)].(string)
+		if !ok {
+			continue
+		}
+		diskPath, ok := params[fmt.Sprintf("block.%d.path", i)].(string)
+		if !ok {
+			continue
+		}
 		/*  "block.<num>.path" - string describing the source of block device <num>,
 		    if it is a file or block device (omitted for network
 		    sources and drives with no media inserted). For network device (i.e. rbd) take from xml. */
@@ -541,7 +551,11 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 	}
 
 	// Report network interface statistics.
-	for i := range params["net.count"].(uint32) {
+	netCount, ok := params["net.count"].(uint32)
+	if !ok {
+		return fmt.Errorf("net.count not found in domain %s stats", domainName)
+	}
+	for i := range netCount {
 		var sourceBridge string
 		var virtualPortInterfaceID string
 		ifaceName, ok := params[fmt.Sprintf("net.%d.name", i)].(string)
