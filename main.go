@@ -319,6 +319,18 @@ func (e *LibvirtExporter) readStealTime(pid int) (float64, error) {
 	return retval, nil
 }
 
+// domainIsRunning reports whether the domain's state.state stat param equals DomainRunning.
+func (e *LibvirtExporter) domainIsRunning(stat libvirt.DomainStatsRecord) bool {
+	for _, p := range stat.Params {
+		if p.Field != "state.state" {
+			continue
+		}
+		state, ok := p.Value.I.(int32)
+		return ok && libvirt.DomainState(state) == libvirt.DomainRunning
+	}
+	return false
+}
+
 // collectDomainStealTime contacts the running QEMU instance via QemuMonitorCommand API call,
 // gets the PIDs of the running CPU threads.
 // It then calls ReadStealTime for every thread to obtain its steal times
@@ -862,7 +874,7 @@ func (e *LibvirtExporter) collectFromLibvirt(ch chan<- prometheus.Metric) error 
 			slog.Warn("Failed to collect domain", "domain", stat.Dom.Name, "err", err)
 			continue
 		}
-		if e.hostProcfs != "" {
+		if e.hostProcfs != "" && e.domainIsRunning(stat) {
 			err = e.collectDomainStealTime(ch, stat.Dom)
 			if err != nil {
 				slog.Warn("Failed to collect steal time", "domain", stat.Dom.Name, "err", err)
