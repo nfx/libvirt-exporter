@@ -1,17 +1,15 @@
-# Stage 1: Build libvirt exporter
-FROM golang:1.14-alpine3.11 as builder
+FROM golang:1.27-alpine AS builder
 
-WORKDIR /usr/src/libvirt_exporter
+WORKDIR /app
 
-# Build app
 COPY . .
-RUN dockerscripts/build_static.sh
 
-# Stage 2: Prepare final image
-FROM scratch
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o libvirt-exporter
 
-# Copy binary from Stage 1
-COPY --from=builder /usr/src/libvirt_exporter/libvirt_exporter .
+FROM alpine
 
-# Entrypoint for starting exporter
-CMD [ "./libvirt_exporter" ]
+COPY --from=builder /app/libvirt-exporter /libvirt-exporter
+
+EXPOSE 9177
+
+ENTRYPOINT ["/libvirt-exporter", "-listen", "0.0.0.0:9177"]

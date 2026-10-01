@@ -1,4 +1,6 @@
 // Copyright 2017 Kumina, https://kumina.nl/
+// Copyright 2019, Alexey Kostin
+// Copyright 2026, Serge Smertin
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -11,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Project forked from https://github.com/kumina/libvirt_exporter
+// Project forked from https://github.com/rumanzo/libvirt_exporter_improved
 
 package main
 
@@ -19,18 +21,18 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/libvirt/libvirt-go"
+	"flag"
+
+	"github.com/digitalocean/go-libvirt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rumanzo/libvirt_exporter_improved/libvirt_schema"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
@@ -225,6 +227,63 @@ var (
 		nil)
 )
 
+type Domain struct {
+	Devices Devices `xml:"devices"`
+}
+
+type Devices struct {
+	Disks      []Disk      `xml:"disk"`
+	Interfaces []Interface `xml:"interface"`
+}
+
+type Disk struct {
+	Device   string     `xml:"device,attr"`
+	Source   DiskSource `xml:"source"`
+	Target   DiskTarget `xml:"target"`
+	DiskType string     `xml:"type,attr"`
+}
+
+type DiskSource struct {
+	File string `xml:"file,attr"`
+	Name string `xml:"name,attr"`
+}
+
+type DiskTarget struct {
+	Device string `xml:"dev,attr"`
+}
+
+type Interface struct {
+	Source      InterfaceSource      `xml:"source"`
+	Target      InterfaceTarget      `xml:"target"`
+	Virtualport InterfaceVirtualPort `xml:"virtualport"`
+}
+
+type InterfaceVirtualPort struct {
+	Parameters InterfaceVirtualPortParam `xml:"parameters"`
+}
+type InterfaceVirtualPortParam struct {
+	InterfaceId string `xml:"interfaceid,attr"`
+}
+
+type InterfaceSource struct {
+	Bridge string `xml:"bridge,attr"`
+}
+
+type InterfaceTarget struct {
+	Device string `xml:"dev,attr"`
+}
+
+type VirDomainMemoryStats struct {
+	Major_fault    uint64
+	Minor_fault    uint64
+	Unused         uint64
+	Available      uint64
+	Actual_balloon uint64
+	Rss            uint64
+	Usable         uint64
+	Disk_caches    uint64
+}
+
 // QueryCPUsResult holds the structured representative of QMP's "query-cpus" output
 type QueryCPUsResult struct {
 	Return []QemuThread `json:"return"`
@@ -238,10 +297,10 @@ type QemuThread struct {
 
 // ReadStealTime reads the file /proc/<thread_id>/schedstat and returns
 // the second field as a float64 value
-func ReadStealTime(pid int) (float64, error) {
+func (e *LibvirtExporter) readStealTime(pid int) (float64, error) {
 	var retval float64
-	path := fmt.Sprintf("/proc/%d/schedstat", pid)
-	result, err := ioutil.ReadFile(path)
+	path := fmt.Sprintf("%s/%d/schedstat", e.hostProcfs, pid)
+	result, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
@@ -249,7 +308,7 @@ func ReadStealTime(pid int) (float64, error) {
 	values := strings.Split(string(result), " ")
 	// We expect exactly 3 fields in the output, otherwise we return error
 	if len(values) != 3 {
-		return 0, fmt.Errorf("Unexpected amount of fields in %s. The file content is \"%s\"", path, result)
+		return 0, fmt.Errorf("%s: not exactly 3 fields: %s", path, result)
 	}
 
 	retval, err = strconv.ParseFloat(values[1], 64)
@@ -260,21 +319,14 @@ func ReadStealTime(pid int) (float64, error) {
 	return retval, nil
 }
 
-// CollectDomainStealTime contacts the running QEMU instance via QemuMonitorCommand API call,
+// collectDomainStealTime contacts the running QEMU instance via QemuMonitorCommand API call,
 // gets the PIDs of the running CPU threads.
 // It then calls ReadStealTime for every thread to obtain its steal times
-func CollectDomainStealTime(ch chan<- prometheus.Metric, domain *libvirt.Domain) error {
+func (e *LibvirtExporter) collectDomainStealTime(ch chan<- prometheus.Metric, domain libvirt.Domain) error {
 	var totalStealTime float64
-	var domainName string
-
-	// Get the domain name
-	domainName, err := domain.GetName()
-	if err != nil {
-		return err
-	}
 
 	// query QEMU directly to ask PID numbers of its CPU threads
-	resultJSON, err := domain.QemuMonitorCommand("{\"execute\": \"query-cpus\"}", libvirt.DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
+	resultJSON, err := e.conn.QEMUDomainMonitorCommand(domain, "{\"execute\": \"query-cpus\"}", 0)
 	if err != nil {
 		return err
 	}
@@ -289,289 +341,314 @@ func CollectDomainStealTime(ch chan<- prometheus.Metric, domain *libvirt.Domain)
 
 	// Now iterate over qemuThreadsResult to get the list of QemuThread
 	for _, thread := range qemuThreadsResult.Return {
-		stealTime, err := ReadStealTime(thread.ThreadID)
+		stealTime, err := e.readStealTime(thread.ThreadID)
 		if err != nil {
-			log.Printf("Error fetching steal time for the thread %d: %v. Skipping", thread.ThreadID, err)
+			slog.Warn("Fetching steal time failed. Skipping", "thread_id", thread.ThreadID, "err", err)
 			continue
 		}
 		// Increment the total steal time
 		totalStealTime += stealTime
 
 		// Send the metric for this CPU
-		ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, stealTime, domainName, fmt.Sprintf("%d", thread.CPU))
+		ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, stealTime, domain.Name, fmt.Sprintf("%d", thread.CPU))
 	}
-	ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, totalStealTime, domainName, "total")
+	ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, totalStealTime, domain.Name, "total")
 	return nil
 }
 
-// CollectDomain extracts Prometheus metrics from a libvirt domain.
-func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error {
-	domainName, err := stat.Domain.GetName()
+// collectDomain extracts Prometheus metrics from a libvirt domain.
+func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStatsRecord) error {
+	dom := stat.Dom
+	domainName := dom.Name
+	// Decode XML description of domain to get block device names, etc.
+	xmlDesc, err := e.conn.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return err
 	}
 
-	// Decode XML description of domain to get block device names, etc.
-	xmlDesc, err := stat.Domain.GetXMLDesc(0)
-	if err != nil {
-		return err
-	}
-	var desc libvirt_schema.Domain
+	var desc Domain
 	err = xml.Unmarshal([]byte(xmlDesc), &desc)
 	if err != nil {
 		return err
 	}
 
 	// Report domain info.
-	info, err := stat.Domain.GetInfo()
+	rState, rMaxMem, rMemory, rNrVirtCPU, rCPUTime, err := e.conn.DomainGetInfo(dom)
 	if err != nil {
 		return err
 	}
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMaxMemDesc,
 		prometheus.GaugeValue,
-		float64(info.MaxMem)*1024,
+		float64(rMaxMem)*1024,
 		domainName)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMemoryUsageDesc,
 		prometheus.GaugeValue,
-		float64(info.Memory)*1024,
+		float64(rMemory)*1024,
 		domainName)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoNrVirtCpuDesc,
 		prometheus.GaugeValue,
-		float64(info.NrVirtCpu),
+		float64(rNrVirtCPU),
 		domainName)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoCpuTimeDesc,
 		prometheus.CounterValue,
-		float64(info.CpuTime)/1e9,
+		float64(rCPUTime)/1e9,
 		domainName)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoVirDomainState,
 		prometheus.CounterValue,
-		float64(info.State),
+		float64(rState),
 		domainName)
+
+	params := map[string]any{}
+	for _, p := range stat.Params {
+		params[p.Field] = p.Value.I
+	}
+
 	// Report block device statistics.
-	for _, disk := range stat.Block {
-		var DiskSource string
-		if disk.Name == "hdc" {
+	for i := range params["block.count"].(uint32) {
+		var diskSource string
+		diskName := params[fmt.Sprintf("block.%d.name", i)].(string)
+		if diskName == "hdc" {
 			continue
 		}
+		diskPath := params[fmt.Sprintf("block.%d.path", i)].(string)
 		/*  "block.<num>.path" - string describing the source of block device <num>,
 		    if it is a file or block device (omitted for network
 		    sources and drives with no media inserted). For network device (i.e. rbd) take from xml. */
 		for _, dev := range desc.Devices.Disks {
-			if dev.Target.Device == disk.Name {
-				if disk.PathSet {
-					DiskSource = disk.Path
-
+			if dev.Target.Device == diskName {
+				if diskPath != "" {
+					diskSource = diskPath
 				} else {
-					DiskSource = dev.Source.Name
+					diskSource = dev.Source.Name
 				}
 				break
 			}
 		}
 
 		// https://libvirt.org/html/libvirt-libvirt-domain.html#virConnectGetAllDomainStats
-		if disk.RdBytesSet {
+		diskRdBytes, ok := params[fmt.Sprintf("block.%d.rd.bytes", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockRdBytesDesc,
 				prometheus.CounterValue,
-				float64(disk.RdBytes),
+				float64(diskRdBytes),
 				domainName,
-				DiskSource,
-				disk.Name)
-		}
-		if disk.RdReqsSet {
-			ch <- prometheus.MustNewConstMetric(
-				libvirtDomainBlockRdReqDesc,
-				prometheus.CounterValue,
-				float64(disk.RdReqs),
-				domainName,
-				DiskSource,
-				disk.Name)
-		}
-		if disk.RdBytesSet {
+				diskSource,
+				diskName)
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockRdTotalTimesDesc,
 				prometheus.CounterValue,
-				float64(disk.RdBytes)/1e9,
+				float64(diskRdBytes)/1e9,
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.WrBytesSet {
+		diskRdReqs, ok := params[fmt.Sprintf("block.%d.rd.reqs", i)].(uint64)
+		if ok {
+			ch <- prometheus.MustNewConstMetric(
+				libvirtDomainBlockRdReqDesc,
+				prometheus.CounterValue,
+				float64(diskRdReqs),
+				domainName,
+				diskSource,
+				diskName)
+		}
+		diskWrBytes, ok := params[fmt.Sprintf("block.%d.wr.bytes", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockWrBytesDesc,
 				prometheus.CounterValue,
-				float64(disk.WrBytes),
+				float64(diskWrBytes),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.WrReqsSet {
+		diskWrReqs, ok := params[fmt.Sprintf("block.%d.wr.reqs", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockWrReqDesc,
 				prometheus.CounterValue,
-				float64(disk.WrReqs),
+				float64(diskWrReqs),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.WrTimesSet {
+		diskWrTimes, ok := params[fmt.Sprintf("block.%d.wr.times", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockWrTotalTimesDesc,
 				prometheus.CounterValue,
-				float64(disk.WrTimes)/1e9,
+				float64(diskWrTimes)/1e9,
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.FlReqsSet {
+		diskFlReqs, ok := params[fmt.Sprintf("block.%d.fl.reqs", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockFlushReqDesc,
 				prometheus.CounterValue,
-				float64(disk.FlReqs),
+				float64(diskFlReqs),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.FlTimesSet {
+		diskFlTimes, ok := params[fmt.Sprintf("block.%d.fl.times", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockFlushTotalTimesDesc,
 				prometheus.CounterValue,
-				float64(disk.FlTimes),
+				float64(diskFlTimes),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.AllocationSet {
+		diskAllocation, ok := params[fmt.Sprintf("block.%d.allocation", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockAllocationDesc,
 				prometheus.CounterValue,
-				float64(disk.Allocation),
+				float64(diskAllocation),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.CapacitySet {
+		diskCapacity, ok := params[fmt.Sprintf("block.%d.capacity", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockCapacityDesc,
 				prometheus.CounterValue,
-				float64(disk.Capacity),
+				float64(diskCapacity),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
-		if disk.PhysicalSet {
+		diskPhysical, ok := params[fmt.Sprintf("block.%d.physical", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainBlockPhysicalSizeDesc,
 				prometheus.CounterValue,
-				float64(disk.Physical),
+				float64(diskPhysical),
 				domainName,
-				DiskSource,
-				disk.Name)
+				diskSource,
+				diskName)
 		}
 	}
 
 	// Report network interface statistics.
-	for _, iface := range stat.Net {
-		var SourceBridge string
-		var VirtualPortInterfaceID string
+	for i := range params["net.count"].(uint32) {
+		var sourceBridge string
+		var virtualPortInterfaceID string
+		ifaceName, ok := params[fmt.Sprintf("net.%d.name", i)].(string)
+		if !ok {
+			continue
+		}
 		// Additional info for ovs network
 		for _, net := range desc.Devices.Interfaces {
-			if net.Target.Device == iface.Name {
-				SourceBridge = net.Source.Bridge
-				VirtualPortInterfaceID = net.Virtualport.Parameters.InterfaceId
+			if net.Target.Device == ifaceName {
+				sourceBridge = net.Source.Bridge
+				virtualPortInterfaceID = net.Virtualport.Parameters.InterfaceId
 				break
 			}
 		}
-		if iface.RxBytesSet {
+		ifaceRxBytes, ok := params[fmt.Sprintf("net.%d.rx.bytes", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceRxBytesDesc,
 				prometheus.CounterValue,
-				float64(iface.RxBytes),
+				float64(ifaceRxBytes),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.RxPktsSet {
+		ifaceRxPkts, ok := params[fmt.Sprintf("net.%d.rx.pkts", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceRxPacketsDesc,
 				prometheus.CounterValue,
-				float64(iface.RxPkts),
+				float64(ifaceRxPkts),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.RxErrsSet {
+		ifaceRxErrs, ok := params[fmt.Sprintf("net.%d.rx.errs", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceRxErrsDesc,
 				prometheus.CounterValue,
-				float64(iface.RxErrs),
+				float64(ifaceRxErrs),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.RxDropSet {
+		ifaceRxDrop, ok := params[fmt.Sprintf("net.%d.rx.drop", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceRxDropDesc,
 				prometheus.CounterValue,
-				float64(iface.RxDrop),
+				float64(ifaceRxDrop),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.TxBytesSet {
+		ifaceTxBytes, ok := params[fmt.Sprintf("net.%d.tx.bytes", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceTxBytesDesc,
 				prometheus.CounterValue,
-				float64(iface.TxBytes),
+				float64(ifaceTxBytes),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.TxPktsSet {
+		ifaceTxPkts, ok := params[fmt.Sprintf("net.%d.tx.pkts", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceTxPacketsDesc,
 				prometheus.CounterValue,
-				float64(iface.TxPkts),
+				float64(ifaceTxPkts),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.TxErrsSet {
+		ifaceTxErrs, ok := params[fmt.Sprintf("net.%d.tx.errs", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceTxErrsDesc,
 				prometheus.CounterValue,
-				float64(iface.TxErrs),
+				float64(ifaceTxErrs),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
-		if iface.TxDropSet {
+		ifaceTxDrop, ok := params[fmt.Sprintf("net.%d.tx.drop", i)].(uint64)
+		if ok {
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainInterfaceTxDropDesc,
 				prometheus.CounterValue,
-				float64(iface.TxDrop),
+				float64(ifaceTxDrop),
 				domainName,
-				SourceBridge,
-				iface.Name,
-				VirtualPortInterfaceID)
+				sourceBridge,
+				ifaceName,
+				virtualPortInterfaceID)
 		}
 	}
 
 	// Collect Memory Stats
-	memorystat, err := stat.Domain.MemoryStats(11, 0)
-	var MemoryStats libvirt_schema.VirDomainMemoryStats
+	memorystat, err := e.conn.DomainMemoryStats(dom, 11, 0)
+	var MemoryStats VirDomainMemoryStats
 	var used_percent float64
 	if err == nil {
 		MemoryStats = MemoryStatCollect(&memorystat)
@@ -629,8 +706,8 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	return nil
 }
 
-func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirt_schema.VirDomainMemoryStats {
-	var MemoryStats libvirt_schema.VirDomainMemoryStats
+func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) VirDomainMemoryStats {
+	var MemoryStats VirDomainMemoryStats
 	for _, domainmemorystat := range *memorystat {
 		switch tag := domainmemorystat.Tag; tag {
 		case 2:
@@ -656,18 +733,28 @@ func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirt_schema.Vi
 
 // LibvirtExporter implements a Prometheus exporter for libvirt state.
 type LibvirtExporter struct {
-	uri      string
-	login    string
-	password string
-	conn     *libvirt.Connect
+	uri        string
+	hostProcfs string
+	conn       *libvirt.Libvirt
 }
 
 // NewLibvirtExporter creates a new Prometheus exporter for libvirt.
-func NewLibvirtExporter(uri string, login string, password string) (*LibvirtExporter, error) {
+func NewLibvirtExporter(uri string, procfs string) (*LibvirtExporter, error) {
+	if uri == "" {
+		uri = "qemu:///system"
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, err
+	}
+	lv, err := libvirt.ConnectToURI(u)
+	if err != nil {
+		return nil, err
+	}
 	return &LibvirtExporter{
-		uri:      uri,
-		login:    login,
-		password: password,
+		uri:        uri,
+		conn:       lv,
+		hostProcfs: procfs,
 	}, nil
 }
 
@@ -720,14 +807,14 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect scrapes Prometheus metrics from libvirt.
 func (e *LibvirtExporter) Collect(ch chan<- prometheus.Metric) {
-	err := e.CollectFromLibvirt(ch)
+	err := e.collectFromLibvirt(ch)
 	if err == nil {
 		ch <- prometheus.MustNewConstMetric(
 			libvirtUpDesc,
 			prometheus.GaugeValue,
 			1.0)
 	} else {
-		log.Printf("Failed to scrape metrics: %s", err)
+		slog.Warn("Failed to scrape metrics", "err", err)
 		ch <- prometheus.MustNewConstMetric(
 			libvirtUpDesc,
 			prometheus.GaugeValue,
@@ -735,111 +822,56 @@ func (e *LibvirtExporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (e *LibvirtExporter) connectLibvirtWithAuth(uri string) (*libvirt.Connect, error) {
-	if e.login == "" || e.password == "" {
-		return nil, fmt.Errorf("Empty username or password was provided. Not attempting to authenticate using SASL")
-	}
-
-	callback := func(creds []*libvirt.ConnectCredential) {
-		for _, cred := range creds {
-			switch cred.Type {
-			case libvirt.CRED_AUTHNAME:
-				cred.Result = e.login
-				cred.ResultLen = len(cred.Result)
-
-			case libvirt.CRED_PASSPHRASE:
-				cred.Result = e.password
-				cred.ResultLen = len(cred.Result)
-
-			}
-		}
-	}
-
-	auth := &libvirt.ConnectAuth{
-		CredType: []libvirt.ConnectCredentialType{
-			libvirt.CRED_AUTHNAME, libvirt.CRED_PASSPHRASE,
-		},
-		Callback: callback,
-	}
-
-	return libvirt.NewConnectWithAuth(uri, auth, 0) // connect flag 0 means "read-write"
-}
-
-func (e *LibvirtExporter) Connect() (isReadonly bool, err error) {
-	// First, try to connect without authentication, and with the full access
-	if e.conn, err = libvirt.NewConnect(e.uri); err == nil {
-		return
-	}
-
-	// Then, if the connection has failed, we try accessing libvirt with the authentication
-	if e.conn, err = e.connectLibvirtWithAuth(e.uri); err == nil {
-		return
-	}
-
-	// Then, if the authenticated connection failed we attempt to connect using readonly
-	if e.conn, err = libvirt.NewConnectReadOnly(e.uri); err == nil {
-		isReadonly = true
-		return
-	}
-
-	return
-}
-
 func (e *LibvirtExporter) Close() {
-	e.conn.Close()
+	e.conn.ConnectClose()
 }
 
-// CollectFromLibvirt obtains Prometheus metrics from all domains in a
-// libvirt setup.
-func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error {
-	readOnly, err := e.Connect()
-	if err != nil {
-		return err
-	}
-	defer e.Close()
-
-	stats, err := e.conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
-		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
-		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU, 0)
+// collectFromLibvirt obtains Prometheus metrics from all domains in a libvirt setup.
+func (e *LibvirtExporter) collectFromLibvirt(ch chan<- prometheus.Metric) error {
+	stats, err := e.conn.ConnectGetAllDomainStats([]libvirt.Domain{}, uint32(libvirt.DomainStatsState|
+		libvirt.DomainStatsCPUTotal|
+		libvirt.DomainStatsInterface|
+		libvirt.DomainStatsBalloon|
+		libvirt.DomainStatsBlock|
+		libvirt.DomainStatsPerf|
+		libvirt.DomainStatsVCPU), 0)
 	if err != nil {
 		return err
 	}
 	for _, stat := range stats {
-		err = CollectDomain(ch, stat)
+		err = e.collectDomain(ch, stat)
 		if err != nil {
-			log.Println(err)
-			stat.Domain.Free()
+			slog.Warn("Failed to collect domain", "domain", stat.Dom.Name, "err", err)
 			continue
 		}
-		if !readOnly {
-			err = CollectDomainStealTime(ch, stat.Domain)
+		if e.hostProcfs != "" {
+			err = e.collectDomainStealTime(ch, stat.Dom)
 			if err != nil {
-				log.Println(err)
-				stat.Domain.Free()
+				slog.Warn("Failed to collect steal time", "domain", stat.Dom.Name, "err", err)
 				continue
 			}
 		}
-		stat.Domain.Free()
 	}
 	return nil
 }
 
 func main() {
-	var (
-		app             = kingpin.New("libvirt_exporter", "Prometheus metrics exporter for libvirt")
-		listenAddress   = app.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9177").String()
-		metricsPath     = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		libvirtURI      = app.Flag("libvirt.uri", "Libvirt URI from which to extract metrics.").Default("qemu:///system").String()
-		libvirtUsername = app.Flag("libvirt.auth.username", "User name for SASL login (you can also use LIBVIRT_EXPORTER_USERNAME environment variable)").Default("").Envar("LIBVIRT_EXPORTER_USERNAME").String()
-		libvirtPassword = app.Flag("libvirt.auth.password", "Password for SASL login (you can also use LIBVIRT_EXPORTER_PASSWORD environment variable)").Default("").Envar("LIBVIRT_EXPORTER_PASSWORD").String()
-	)
-	kingpin.MustParse(app.Parse(os.Args[1:]))
+	defaultAddr := os.Getenv("LIBVIRT_EXPORTER_LISTEN")
+	if defaultAddr == "" {
+		defaultAddr = ":9177"
+	}
+	listenAddress := flag.String("listen", defaultAddr, "Address to listen on for web interface and telemetry.")
+	metricsPath := flag.String("path", "/metrics", "Path under which to expose metrics.")
+	libvirtURI := flag.String("uri", os.Getenv("LIBVIRT_EXPORTER_URI"), "Libvirt URI from which to extract metrics.")
+	procfs := flag.String("procfs", os.Getenv("LIBVIRT_EXPORTER_PROCFS"), "Path where `/proc` from host is mounted. Usually `/host/proc` in containerized environments.")
+	flag.Parse()
 
-	exporter, err := NewLibvirtExporter(*libvirtURI, *libvirtUsername, *libvirtPassword)
+	exporter, err := NewLibvirtExporter(*libvirtURI, *procfs)
 	if err != nil {
 		panic(err)
 	}
 	prometheus.MustRegister(exporter)
+	slog.Info("Initialized libvirt-exporter", "listenAddress", *listenAddress)
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -852,5 +884,8 @@ func main() {
 			</body>
 			</html>`))
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	err = http.ListenAndServe(*listenAddress, nil)
+	if err != nil {
+		slog.Error("listen", "err", err)
+	}
 }
