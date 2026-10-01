@@ -328,7 +328,7 @@ func (e *LibvirtExporter) collectDomainStealTime(ch chan<- prometheus.Metric, do
 	// query QEMU directly to ask PID numbers of its CPU threads
 	resultJSON, err := e.conn.QEMUDomainMonitorCommand(domain, "{\"execute\": \"query-cpus\"}", 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("query cpus: %w", err)
 	}
 	// Allocate a map for the json parser results
 	qemuThreadsResult := QueryCPUsResult{Return: make([]QemuThread, 0, 8)}
@@ -336,7 +336,7 @@ func (e *LibvirtExporter) collectDomainStealTime(ch chan<- prometheus.Metric, do
 	// Parse the result into the map
 	err = json.Unmarshal([]byte(resultJSON), &qemuThreadsResult)
 	if err != nil {
-		return err
+		return fmt.Errorf("unmarshal: %w", err)
 	}
 
 	// Now iterate over qemuThreadsResult to get the list of QemuThread
@@ -363,19 +363,19 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 	// Decode XML description of domain to get block device names, etc.
 	xmlDesc, err := e.conn.DomainGetXMLDesc(dom, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("xml: %w", err)
 	}
 
 	var desc Domain
 	err = xml.Unmarshal([]byte(xmlDesc), &desc)
 	if err != nil {
-		return err
+		return fmt.Errorf("unmarshal: %w", err)
 	}
 
 	// Report domain info.
 	rState, rMaxMem, rMemory, rNrVirtCPU, rCPUTime, err := e.conn.DomainGetInfo(dom)
 	if err != nil {
-		return err
+		return fmt.Errorf("get info: %w", err)
 	}
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMaxMemDesc,
@@ -850,7 +850,7 @@ func (e *LibvirtExporter) collectFromLibvirt(ch chan<- prometheus.Metric) error 
 		libvirt.DomainStatsPerf|
 		libvirt.DomainStatsVCPU), 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("domain stats: %w", err)
 	}
 	for _, stat := range stats {
 		err = e.collectDomain(ch, stat)
