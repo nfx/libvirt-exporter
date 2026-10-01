@@ -284,19 +284,19 @@ type VirDomainMemoryStats struct {
 	Disk_caches    uint64
 }
 
-// QueryCPUsResult holds the structured representative of QMP's "query-cpus" output
+// QueryCPUsResult holds the structured representative of QMP's "query-cpus" output.
 type QueryCPUsResult struct {
 	Return []QemuThread `json:"return"`
 }
 
-// QemuThread holds qemu thread info: which virtual cpu is it, what the thread PID is
+// QemuThread holds qemu thread info: which virtual cpu is it, what the thread PID is.
 type QemuThread struct {
 	CPU      int
 	ThreadID int `json:"thread_id"`
 }
 
 // ReadStealTime reads the file /proc/<thread_id>/schedstat and returns
-// the second field as a float64 value
+// the second field as a float64 value.
 func (e *LibvirtExporter) readStealTime(pid int) (float64, error) {
 	var retval float64
 	path := fmt.Sprintf("%s/%d/schedstat", e.hostProcfs, pid)
@@ -333,7 +333,7 @@ func (e *LibvirtExporter) domainIsRunning(stat libvirt.DomainStatsRecord) bool {
 
 // collectDomainStealTime contacts the running QEMU instance via QemuMonitorCommand API call,
 // gets the PIDs of the running CPU threads.
-// It then calls ReadStealTime for every thread to obtain its steal times
+// It then calls ReadStealTime for every thread to obtain its steal times.
 func (e *LibvirtExporter) collectDomainStealTime(ch chan<- prometheus.Metric, domain libvirt.Domain) error {
 	var totalStealTime float64
 
@@ -362,7 +362,7 @@ func (e *LibvirtExporter) collectDomainStealTime(ch chan<- prometheus.Metric, do
 		totalStealTime += stealTime
 
 		// Send the metric for this CPU
-		ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, stealTime, domain.Name, fmt.Sprintf("%d", thread.CPU))
+		ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, stealTime, domain.Name, strconv.Itoa(thread.CPU))
 	}
 	ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, totalStealTime, domain.Name, "total")
 	return nil
@@ -577,7 +577,6 @@ func (e *LibvirtExporter) collectDomain(ch chan<- prometheus.Metric, stat libvir
 		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
 			used_percent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
 		}
-
 	}
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainMemoryStatMajorfaultDesc,
